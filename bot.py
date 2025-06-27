@@ -1,6 +1,7 @@
 import random
 import logging
 import sqlite3
+from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.error import BadRequest
@@ -125,8 +126,78 @@ HANGMAN_ART = [
     """
 ]
 
+# ===== GAME STATE =====
 games = {}
 
+# ===== DATABASE FUNCTIONS =====
+def init_db():
+    """Initialize the database"""
+    conn = sqlite3.connect('hangman_scores.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS players
+                 (user_id INTEGER PRIMARY KEY, 
+                  username TEXT,
+                  games_played INTEGER DEFAULT 0,
+                  games_won INTEGER DEFAULT 0,
+                  total_score INTEGER DEFAULT 0,
+                  last_played TEXT)''')
+    conn.commit()
+    conn.close()
+
+def get_player_stats(user_id: int):
+    """Get player statistics from the database"""
+    conn = sqlite3.connect('hangman_scores.db')
+    c = conn.cursor()
+    c.execute('''SELECT games_played, games_won, total_score 
+                 FROM players 
+                 WHERE user_id = ?''', (user_id,))
+    stats = c.fetchone()
+    conn.close()
+    return stats
+
+def get_leaderboard(limit: int = 10):
+    """Get top players from the database"""
+    conn = sqlite3.connect('hangman_scores.db')
+    c = conn.cursor()
+    c.execute('''SELECT username, games_won, total_score 
+                 FROM players 
+                 ORDER BY total_score DESC 
+                 LIMIT ?''', (limit,))
+    leaderboard = c.fetchall()
+    conn.close()
+    return leaderboard
+
+def update_score(user_id: int, username: str, won: bool, score: int = 0):
+    """Update player stats in the database"""
+    conn = sqlite3.connect('hangman_scores.db')
+    c = conn.cursor()
+    
+    # Get current stats
+    c.execute('SELECT * FROM players WHERE user_id = ?', (user_id,))
+    player = c.fetchone()
+    
+    if player:
+        games_played = player[2] + 1
+        games_won = player[3] + (1 if won else 0)
+        total_score = player[4] + score
+        c.execute('''UPDATE players 
+                     SET games_played = ?, 
+                         games_won = ?,
+                         total_score = ?,
+                         last_played = ?,
+                         username = ?
+                     WHERE user_id = ?''',
+                  (games_played, games_won, total_score, datetime.now().isoformat(), username, user_id))
+    else:
+        c.execute('''INSERT INTO players 
+                     (user_id, username, games_played, games_won, total_score, last_played)
+                     VALUES (?, ?, 1, ?, ?, ?)''',
+                  (user_id, username, 1 if won else 0, score, datetime.now().isoformat()))
+    
+    conn.commit()
+    conn.close()
+
+# ===== GAME FUNCTIONS =====
 def get_random_word():
     """Select a random word and its hint from the dictionary"""
     word = random.choice(list(FALLBACK_DICT.keys()))
@@ -150,17 +221,20 @@ def display_game_state(game):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         chat_id = update.message.chat_id
+        user = update.effective_user
         word, hint = get_random_word()
         
         games[chat_id] = {
             "word": word,
             "hint": hint,
             "guessed_letters": [],
-            "lives": 6
+            "lives": 6,
+            "player_id": user.id,
+            "player_name": user.full_name
         }
         
         await update.message.reply_text(
-            "🎮 *Hangman Game Started!*\n"
+            f"🎮 *Hangman Game Started!* {user.mention_markdown()}\n"
             f"📏 Word has {len(word)} letters\n"
             f"💡 Hint: {hint}",
             parse_mode="Markdown"
@@ -184,6 +258,7 @@ async def send_game_update(update: Update, chat_id):
 async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         chat_id = update.message.chat_id
+        user = update.effective_user
         user_input = update.message.text.upper()
         
         if chat_id not in games:
@@ -212,16 +287,31 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Check game status
         if all(letter in game["guessed_letters"] for letter in game["word"]):
+            score = len(game["word"]) * 10 + game["lives"] * 5
+            update_score(
+                user_id=game["player_id"],
+                username=game["player_name"],
+                won=True,
+                score=score
+            )
             await update.message.reply_text(
                 f"🎉 *You won!* The word was: {game['word']}\n"
-                "Play again with /start",
+                f"🏆 Score: +{score} points!\n"
+                "Play again with /start\n"
+                "Check /stats for your progress",
                 parse_mode="Markdown"
             )
             del games[chat_id]
         elif game["lives"] <= 0:
+            update_score(
+                user_id=game["player_id"],
+                username=game["player_name"],
+                won=False
+            )
             await update.message.reply_text(
-                f"💀 *Game Over!* The word was: {game['word']}\n"
-                "Play again with /start",
+                f"💀 *Game Over!* The word was: {game['word']}\n\n"
+                "Play again with /start\n"
+                "Check /stats for your progress",
                 parse_mode="Markdown"
             )
             del games[chat_id]
@@ -232,15 +322,60 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Guess error: {e}")
         await update.message.reply_text("🚨 Error processing your guess. Please try again.")
 
+async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user = update.effective_user
+        stats = get_player_stats(user.id)
+        
+        if not stats:
+            await update.message.reply_text("You haven't played any games yet! Type /start to begin.")
+            return
+            
+        win_percentage = (stats[1] / stats[0]) * 100 if stats[0] > 0 else 0
+        
+        await update.message.reply_text(
+            f"📊 *Your Stats* {user.mention_markdown()}\n\n"
+            f"🎮 Games Played: {stats[0]}\n"
+            f"🏆 Games Won: {stats[1]} ({win_percentage:.1f}%)\n"
+            f"⭐ Total Score: {stats[2]}\n\n"
+            "Check /leaderboard for top players",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Stats error: {e}")
+        await update.message.reply_text("🚨 Couldn't fetch your stats. Please try again.")
+
+async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        leaderboard = get_leaderboard()
+        
+        if not leaderboard:
+            await update.message.reply_text("No players yet! Be the first with /start")
+            return
+            
+        leaderboard_text = "🏆 *Top Players* 🏆\n\n"
+        for i, (username, wins, score) in enumerate(leaderboard, 1):
+            leaderboard_text += f"{i}. {username}: {score} pts ({wins} wins)\n"
+            
+        await update.message.reply_text(
+            leaderboard_text,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Leaderboard error: {e}")
+        await update.message.reply_text("🚨 Couldn't fetch leaderboard. Please try again.")
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🆘 *Hangman Bot Help*\n\n"
         "🔹 /start - Begin new game\n"
+        "🔹 /stats - View your statistics\n"
+        "🔹 /leaderboard - See top players\n"
         "🔹 /help - Show this message\n\n"
         "How to play:\n"
         "1. Guess letters one at a time\n"
         "2. Solve the word before the hangman is complete\n"
-        "3. Each game comes with a helpful hint",
+        "3. Earn more points for longer words and remaining lives",
         parse_mode="Markdown"
     )
 
@@ -256,11 +391,16 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ===== BOT SETUP =====
 def main():
     """Run the bot."""
-    # Replace with your actual bot token
+    # Initialize database
+    init_db()
+    
+    # Create Application
     application = Application.builder().token("7762698810:AAHJdUVaS17C3pJnYYS-kxlViFsL4-iIgzA").build()
     
     # Add handlers
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("stats", show_stats))
+    application.add_handler(CommandHandler("leaderboard", show_leaderboard))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_guess))
     
@@ -269,22 +409,6 @@ def main():
     
     logger.info("Bot is running and polling...")
     application.run_polling()
-
-def init_db():
-    conn = sqlite3.connect('hangman_scores.db')  # This creates the file
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS players
-                 (user_id INTEGER PRIMARY KEY, 
-                  username TEXT,
-                  games_played INTEGER DEFAULT 0,
-                  games_won INTEGER DEFAULT 0,
-                  total_score INTEGER DEFAULT 0,
-                  last_played TEXT)''')
-    conn.commit()
-    conn.close()
-
-# Call this when the bot starts
-init_db()  # ← Important!
 
 if __name__ == "__main__":
     main()
