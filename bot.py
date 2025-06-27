@@ -1,5 +1,6 @@
 import random
 import logging
+import sqlite3
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.error import BadRequest
@@ -268,6 +269,22 @@ def main():
     
     logger.info("Bot is running and polling...")
     application.run_polling()
+
+def init_db():
+    conn = sqlite3.connect('hangman_scores.db')  # This creates the file
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS players
+                 (user_id INTEGER PRIMARY KEY, 
+                  username TEXT,
+                  games_played INTEGER DEFAULT 0,
+                  games_won INTEGER DEFAULT 0,
+                  total_score INTEGER DEFAULT 0,
+                  last_played TEXT)''')
+    conn.commit()
+    conn.close()
+
+# Call this when the bot starts
+init_db()  # ← Important!
 
 if __name__ == "__main__":
     main()
